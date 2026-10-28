@@ -1,0 +1,1341 @@
+// KytyVulkan - Vulkan helper utilities for the Kyty PS5 emulator
+// (Linux / Windows / macOS via MoltenVK).
+//
+// Features
+//   1. Queue family selection: graphics plus dedicated compute / transfer families (async work).
+//   2. ReBAR / SAM / UMA detection and a buffer allocator with fallbacks (direct CPU writes to
+//      VRAM when it pays off, staging otherwise).
+//   3. Sub-allocation: many small buffers share a few large VkDeviceMemory blocks, which keeps the
+//      device far away from VkPhysicalDeviceLimits::maxMemoryAllocationCount.
+//   4. Memory budget awareness (VK_EXT_memory_budget) to avoid paging and driver resets (TDR).
+//   5. Timeline semaphores and a batched submit helper that never touches the heap.
+//   6. On-disk pipeline cache with header validation and atomic writes.
+//   7. MoltenVK support (portability enumeration / portability subset).
+//   8. RAII wrappers, so early returns and exceptions cannot leak Vulkan objects.
+//   9. Physical device selection: rejects GPUs without the required features, picks the best one.
+//
+// What it does NOT do: it does not bypass any protection mechanism and does not access hardware
+// outside of the Vulkan API.
+//
+// Requirements: C++20, a Vulkan 1.2+ instance and device, and a linked Vulkan loader (or a
+// function loader such as volk that provides the vk* symbols).
+//
+// Threading
+//   * Allocator::CreateBuffer, Buffer::Reset, Allocator::Trim and Allocator::GetStats are
+//     internally synchronized.
+//   * Allocator::Flush / Allocator::Invalidate, SubmitTimeline and WaitTimeline take no locks.
+//     Vulkan's external-synchronization rules for the objects you pass in still apply (for
+//     example, a VkQueue must not be submitted to from two threads at once).
+//   * Command pools are not thread-safe: use one pool per thread.
+//
+// Lifetime
+//   * Every Buffer must be destroyed (or Reset) before the Allocator that created it, and the
+//     Allocator must be destroyed before the VkDevice. A debug assertion checks the former.
+//
+// Heap usage
+//   * Flush, Invalidate, SubmitTimeline and WaitTimeline never allocate from the heap.
+//   * CreateBuffer / Buffer::Reset avoid heap allocation in the steady state (free lists are
+//     pre-reserved), but a new memory block or an unusually fragmented block can still allocate.
+//     They are intended for load time or level transitions, not for per-frame use. For per-frame
+//     data, create one persistently mapped buffer up front and sub-divide it with a ring buffer.
+//
+// Status: not yet validated on real hardware. Please run with the Vulkan validation layers
+// enabled and report any message they produce.
+//
+// Example
+//   auto picked   = KytyVulkan::PickPhysicalDevice(instance);   // best GPU that meets the requirements
+//   auto gpu      = picked->gpu;
+//   auto families = picked->families;
+//   auto support  = picked->support;                            // support.extensions -> VkDeviceCreateInfo
+//   // ... create the VkDevice (enable timelineSemaphore if support.timelineSemaphore) ...
+//   KytyVulkan::Allocator allocator(gpu, device, support.memoryBudget);
+//   KytyVulkan::Buffer    buffer;
+//   if (allocator.CreateBuffer(1 << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+//                              KytyVulkan::MemoryUsage::BarUpload, buffer) == VK_SUCCESS) {
+//       std::memcpy(buffer.Mapped(), src, 1 << 20);
+//       (void)allocator.Flush(buffer);  // no-op on coherent memory
+//   }
+
+#pragma once
+
+#include <vulkan/vulkan.h>
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <span>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+namespace KytyVulkan {
+
+namespace detail {
+
+// Returned for arguments that violate a function's contract (null handles, out-of-range offsets).
+inline constexpr VkResult kInvalidArgument = VK_ERROR_VALIDATION_FAILED_EXT;
+
+inline constexpr VkMemoryPropertyFlags kDeviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+inline constexpr VkMemoryPropertyFlags kHostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+inline constexpr VkMemoryPropertyFlags kHostCoherent = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+inline constexpr VkMemoryPropertyFlags kHostCached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+// Rounds v up to a multiple of a. Callers guarantee that v + a cannot overflow.
+[[nodiscard]] constexpr VkDeviceSize AlignUp(VkDeviceSize v, VkDeviceSize a) noexcept {
+	return a <= 1 ? v : ((v + a - 1) / a) * a;
+}
+
+// Runs the usual two-call Vulkan enumeration pattern and retries on VK_INCOMPLETE.
+// `fn` has the signature VkResult(uint32_t*, VkExtensionProperties*).
+template <typename Fn>
+[[nodiscard]] bool EnumerateExtensions(Fn&& fn, std::vector<VkExtensionProperties>& out) {
+	VkResult result = VK_INCOMPLETE;
+
+	while (result == VK_INCOMPLETE) {
+		uint32_t count = 0;
+		if (fn(&count, nullptr) != VK_SUCCESS) {
+			return false;
+		}
+
+		out.assign(count, VkExtensionProperties {});
+		result = fn(&count, out.data());
+		out.resize(std::min<size_t>(count, out.size()));
+	}
+
+	return result == VK_SUCCESS;
+}
+
+[[nodiscard]] inline bool ContainsExtension(const std::vector<VkExtensionProperties>& props, const char* name) noexcept {
+	return std::any_of(props.begin(), props.end(), [name](const VkExtensionProperties& p) {
+		return std::strcmp(p.extensionName, name) == 0;
+	});
+}
+
+} // namespace detail
+
+// ---------------------------------------------------------------------------------------------
+// 0. RAII helpers
+// ---------------------------------------------------------------------------------------------
+
+struct SemaphoreDeleter {
+	void operator()(VkDevice device, VkSemaphore handle) const noexcept { vkDestroySemaphore(device, handle, nullptr); }
+};
+
+struct CommandPoolDeleter {
+	void operator()(VkDevice device, VkCommandPool handle) const noexcept { vkDestroyCommandPool(device, handle, nullptr); }
+};
+
+struct PipelineCacheDeleter {
+	void operator()(VkDevice device, VkPipelineCache handle) const noexcept { vkDestroyPipelineCache(device, handle, nullptr); }
+};
+
+struct BufferDeleter {
+	void operator()(VkDevice device, VkBuffer handle) const noexcept { vkDestroyBuffer(device, handle, nullptr); }
+};
+
+// Move-only owner of a device-level Vulkan handle. The VkDevice must outlive the wrapper.
+template <typename Handle, typename Deleter>
+class DeviceHandle {
+public:
+	DeviceHandle() noexcept = default;
+	DeviceHandle(VkDevice device, Handle handle) noexcept: m_device(device), m_handle(handle) {}
+	~DeviceHandle() { Reset(); }
+
+	DeviceHandle(const DeviceHandle&)            = delete;
+	DeviceHandle& operator=(const DeviceHandle&) = delete;
+
+	DeviceHandle(DeviceHandle&& other) noexcept: m_device(other.m_device), m_handle(other.Release()) {}
+
+	DeviceHandle& operator=(DeviceHandle&& other) noexcept {
+		if (this != &other) {
+			Reset();
+			m_device = other.m_device;
+			m_handle = other.Release();
+		}
+		return *this;
+	}
+
+	[[nodiscard]] Handle Get() const noexcept { return m_handle; }
+
+	// Gives up ownership without destroying the handle.
+	[[nodiscard]] Handle Release() noexcept {
+		Handle h = m_handle;
+		m_handle = VK_NULL_HANDLE;
+		return h;
+	}
+
+	void Reset() noexcept {
+		if (m_handle != VK_NULL_HANDLE) {
+			Deleter {}(m_device, m_handle);
+			m_handle = VK_NULL_HANDLE;
+		}
+	}
+
+	[[nodiscard]] explicit operator bool() const noexcept { return m_handle != VK_NULL_HANDLE; }
+
+private:
+	VkDevice m_device = VK_NULL_HANDLE;
+	Handle   m_handle = VK_NULL_HANDLE;
+};
+
+using ScopedSemaphore     = DeviceHandle<VkSemaphore, SemaphoreDeleter>;
+using ScopedCommandPool   = DeviceHandle<VkCommandPool, CommandPoolDeleter>;
+using ScopedPipelineCache = DeviceHandle<VkPipelineCache, PipelineCacheDeleter>;
+
+// ---------------------------------------------------------------------------------------------
+// 1. Instance / device: extensions and features
+// ---------------------------------------------------------------------------------------------
+
+// Appends the extensions and flags required for instance creation on MoltenVK (macOS). Without
+// them the instance does not report any GPU there. A no-op on every other platform.
+inline void AppendInstancePortability(std::vector<const char*>& extensions, VkInstanceCreateFlags& flags) {
+#ifdef VK_INSTANCE_CREATE_ENABLE_PORTABILITY_BIT_KHR
+	std::vector<VkExtensionProperties> props;
+	const bool listed = detail::EnumerateExtensions(
+	    [](uint32_t* count, VkExtensionProperties* data) { return vkEnumerateInstanceExtensionProperties(nullptr, count, data); },
+	    props);
+
+	if (listed && detail::ContainsExtension(props, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+		extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+		flags |= VK_INSTANCE_CREATE_ENABLE_PORTABILITY_BIT_KHR;
+	}
+#else
+	(void)extensions;
+	(void)flags;
+#endif
+}
+
+[[nodiscard]] inline bool HasDeviceExtension(VkPhysicalDevice gpu, const char* name) {
+	if (gpu == VK_NULL_HANDLE || name == nullptr) {
+		return false;
+	}
+
+	std::vector<VkExtensionProperties> props;
+	const bool listed = detail::EnumerateExtensions(
+	    [gpu](uint32_t* count, VkExtensionProperties* data) { return vkEnumerateDeviceExtensionProperties(gpu, nullptr, count, data); },
+	    props);
+
+	return listed && detail::ContainsExtension(props, name);
+}
+
+struct DeviceSupport {
+	std::vector<const char*> extensions;              // Append to VkDeviceCreateInfo::ppEnabledExtensionNames.
+	bool                     memoryBudget      = false; // VK_EXT_memory_budget is available (and listed above).
+	bool                     timelineSemaphore = false; // Enable VkPhysicalDeviceVulkan12Features::timelineSemaphore.
+};
+
+[[nodiscard]] inline DeviceSupport QueryDeviceSupport(VkPhysicalDevice gpu) {
+	DeviceSupport support;
+
+	if (HasDeviceExtension(gpu, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+		support.memoryBudget = true;
+		support.extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+	}
+
+	// The specification requires enabling this extension whenever the device exposes it (MoltenVK).
+	if (HasDeviceExtension(gpu, "VK_KHR_portability_subset")) {
+		support.extensions.push_back("VK_KHR_portability_subset");
+	}
+
+	VkPhysicalDeviceProperties props {};
+	vkGetPhysicalDeviceProperties(gpu, &props);
+
+	if (props.apiVersion >= VK_API_VERSION_1_2) {
+		VkPhysicalDeviceVulkan12Features features12 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+		VkPhysicalDeviceFeatures2        features2 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
+		vkGetPhysicalDeviceFeatures2(gpu, &features2);
+		support.timelineSemaphore = features12.timelineSemaphore == VK_TRUE;
+	}
+
+	return support;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2. Queue families and command pools
+// ---------------------------------------------------------------------------------------------
+
+struct QueueFamilies {
+	uint32_t graphics = UINT32_MAX;
+	uint32_t compute  = UINT32_MAX; // Dedicated family if one exists, otherwise equal to `graphics`.
+	uint32_t transfer = UINT32_MAX; // Dedicated (DMA) family if one exists, otherwise equal to `graphics`.
+
+	[[nodiscard]] bool HasDedicatedCompute() const noexcept { return compute != graphics; }
+	[[nodiscard]] bool HasDedicatedTransfer() const noexcept { return transfer != graphics; }
+};
+
+// Note: this does not check presentation support, which requires a VkSurfaceKHR. Verify it
+// separately for the graphics family.
+[[nodiscard]] inline std::optional<QueueFamilies> PickQueueFamilies(VkPhysicalDevice gpu) {
+	uint32_t count = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, nullptr);
+
+	std::vector<VkQueueFamilyProperties> props(count);
+	vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, props.data());
+	props.resize(std::min<size_t>(count, props.size()));
+
+	QueueFamilies families;
+
+	for (uint32_t i = 0; i < props.size(); i++) {
+		if (props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+			families.graphics = i;
+			break;
+		}
+	}
+
+	if (families.graphics == UINT32_MAX) {
+		return std::nullopt;
+	}
+
+	families.compute  = families.graphics;
+	families.transfer = families.graphics;
+
+	for (uint32_t i = 0; i < props.size(); i++) {
+		const VkQueueFlags flags = props[i].queueFlags;
+
+		if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT) && families.compute == families.graphics) {
+			families.compute = i;
+		}
+
+		if ((flags & VK_QUEUE_TRANSFER_BIT) && !(flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) &&
+		    families.transfer == families.graphics) {
+			families.transfer = i;
+		}
+	}
+
+	return families;
+}
+
+// Creates a command pool for one thread. Pools are NOT thread-safe: use one pool per thread.
+[[nodiscard]] inline VkResult CreateCommandPool(VkDevice device, uint32_t family, bool transient, VkCommandPool& out) noexcept {
+	out = VK_NULL_HANDLE;
+
+	VkCommandPoolCreateInfo info {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+	info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | (transient ? VK_COMMAND_POOL_CREATE_TRANSIENT_BIT : 0);
+	info.queueFamilyIndex = family;
+	return vkCreateCommandPool(device, &info, nullptr, &out);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 3. Timeline semaphores and submission
+// ---------------------------------------------------------------------------------------------
+
+[[nodiscard]] inline VkResult CreateTimelineSemaphore(VkDevice device, uint64_t initial, VkSemaphore& out) noexcept {
+	out = VK_NULL_HANDLE;
+
+	VkSemaphoreTypeCreateInfo type {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+	type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	type.initialValue  = initial;
+
+	VkSemaphoreCreateInfo info {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+	return vkCreateSemaphore(device, &info, nullptr, &out);
+}
+
+// Returns VK_SUCCESS once the semaphore reached `value`, or VK_TIMEOUT if it did not in time.
+[[nodiscard]] inline VkResult WaitTimeline(VkDevice device, VkSemaphore semaphore, uint64_t value, uint64_t timeout_ns) noexcept {
+	if (semaphore == VK_NULL_HANDLE) {
+		return detail::kInvalidArgument;
+	}
+
+	VkSemaphoreWaitInfo info {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+	info.semaphoreCount = 1;
+	info.pSemaphores    = &semaphore;
+	info.pValues        = &value;
+	return vkWaitSemaphores(device, &info, timeout_ns);
+}
+
+struct TimelineWait {
+	VkSemaphore          semaphore;
+	uint64_t             value;
+	VkPipelineStageFlags stage;
+};
+
+// Submits a whole batch of command buffers with a single vkQueueSubmit call (less CPU overhead).
+// Uses only stack storage; at most kMaxTimelineWaits wait entries are supported.
+inline constexpr size_t kMaxTimelineWaits = 8;
+
+[[nodiscard]] inline VkResult SubmitTimeline(VkQueue queue, std::span<const VkCommandBuffer> commands,
+                                             std::span<const TimelineWait> waits, VkSemaphore signal_semaphore,
+                                             uint64_t signal_value, VkFence fence = VK_NULL_HANDLE) noexcept {
+	if (queue == VK_NULL_HANDLE) {
+		return detail::kInvalidArgument;
+	}
+
+	if (waits.size() > kMaxTimelineWaits) {
+		return VK_ERROR_TOO_MANY_OBJECTS;
+	}
+
+	std::array<VkSemaphore, kMaxTimelineWaits>          wait_semaphores {};
+	std::array<uint64_t, kMaxTimelineWaits>             wait_values {};
+	std::array<VkPipelineStageFlags, kMaxTimelineWaits> wait_stages {};
+
+	for (size_t i = 0; i < waits.size(); i++) {
+		if (waits[i].semaphore == VK_NULL_HANDLE) {
+			return detail::kInvalidArgument;
+		}
+
+		wait_semaphores[i] = waits[i].semaphore;
+		wait_values[i]     = waits[i].value;
+		wait_stages[i]     = waits[i].stage;
+	}
+
+	const uint32_t signal_count = signal_semaphore != VK_NULL_HANDLE ? 1 : 0;
+
+	VkTimelineSemaphoreSubmitInfo timeline {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+	timeline.waitSemaphoreValueCount   = static_cast<uint32_t>(waits.size());
+	timeline.pWaitSemaphoreValues      = wait_values.data();
+	timeline.signalSemaphoreValueCount = signal_count;
+	timeline.pSignalSemaphoreValues    = &signal_value;
+
+	VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+	submit.waitSemaphoreCount   = static_cast<uint32_t>(waits.size());
+	submit.pWaitSemaphores      = wait_semaphores.data();
+	submit.pWaitDstStageMask    = wait_stages.data();
+	submit.commandBufferCount   = static_cast<uint32_t>(commands.size());
+	submit.pCommandBuffers      = commands.data();
+	submit.signalSemaphoreCount = signal_count;
+	submit.pSignalSemaphores    = &signal_semaphore;
+
+	return vkQueueSubmit(queue, 1, &submit, fence);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4. Memory: ReBAR / UMA detection and the sub-allocating buffer allocator
+// ---------------------------------------------------------------------------------------------
+
+struct MemoryInfo {
+	VkDeviceSize deviceLocalBytes = 0;     // Largest DEVICE_LOCAL heap.
+	VkDeviceSize barBytes         = 0;     // Largest heap that has a DEVICE_LOCAL | HOST_VISIBLE type.
+	bool         unified          = false; // Every heap is DEVICE_LOCAL (integrated GPUs, Apple silicon).
+	bool         resizableBar     = false; // BAR window clearly larger than the classic 256 MiB.
+};
+
+[[nodiscard]] inline MemoryInfo QueryMemoryInfo(const VkPhysicalDeviceMemoryProperties& mp) noexcept {
+	MemoryInfo info;
+	info.unified = mp.memoryHeapCount > 0;
+
+	for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+		if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+			info.deviceLocalBytes = std::max(info.deviceLocalBytes, mp.memoryHeaps[i].size);
+		} else {
+			info.unified = false;
+		}
+	}
+
+	constexpr VkMemoryPropertyFlags kBar = detail::kDeviceLocal | detail::kHostVisible;
+	for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+		if ((mp.memoryTypes[i].propertyFlags & kBar) == kBar) {
+			info.barBytes = std::max(info.barBytes, mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size);
+		}
+	}
+
+	info.resizableBar = !info.unified && info.barBytes > (256ull << 20);
+	return info;
+}
+
+enum class MemoryUsage {
+	DeviceOnly, // GPU access only (vertex buffers, storage buffers): fastest for the GPU.
+	Staging,    // CPU -> GPU through a copy; does NOT consume the BAR window.
+	BarUpload,  // CPU writes straight into VRAM (ReBAR / UMA); falls back to Staging.
+	Readback,   // GPU -> CPU, prefers host-cached memory.
+};
+
+struct AllocatorConfig {
+	// Size of one VkDeviceMemory block. On heaps of 1 GiB or less it is capped at 1/8 of the heap.
+	// Requests larger than half a block get their own dedicated VkDeviceMemory.
+	VkDeviceSize blockSize = 64ull << 20;
+
+	// Upper bound for live VkDeviceMemory objects created by this allocator. 0 means "use the
+	// device limit". Lower it when other code in the process shares the same device limit.
+	uint32_t maxAllocations = 0;
+};
+
+struct AllocatorStats {
+	uint32_t     deviceMemoryAllocations = 0; // Live VkDeviceMemory objects.
+	uint32_t     liveBuffers             = 0;
+	VkDeviceSize reservedBytes           = 0; // Total size of all live VkDeviceMemory objects.
+	VkDeviceSize usedBytes               = 0; // Bytes handed out to buffers (including alignment padding).
+};
+
+class Allocator;
+
+// A buffer plus the memory it lives in. Move-only; destroying or resetting it returns the memory
+// to the allocator and destroys the VkBuffer. It must not outlive the Allocator that created it.
+class Buffer {
+public:
+	Buffer() noexcept = default;
+	~Buffer() { Reset(); }
+
+	Buffer(const Buffer&)            = delete;
+	Buffer& operator=(const Buffer&) = delete;
+
+	Buffer(Buffer&& other) noexcept { MoveFrom(other); }
+
+	Buffer& operator=(Buffer&& other) noexcept {
+		if (this != &other) {
+			Reset();
+			MoveFrom(other);
+		}
+		return *this;
+	}
+
+	// Destroys the buffer and releases its memory. Safe to call repeatedly.
+	void Reset() noexcept;
+
+	[[nodiscard]] VkBuffer              Handle() const noexcept { return m_buffer; }
+	[[nodiscard]] VkDeviceSize          Size() const noexcept { return m_size; }
+	[[nodiscard]] void*                 Mapped() const noexcept { return m_mapped; } // nullptr if not host visible.
+	[[nodiscard]] VkMemoryPropertyFlags MemoryFlags() const noexcept { return m_flags; }
+	[[nodiscard]] bool                  Coherent() const noexcept { return (m_flags & detail::kHostCoherent) != 0; }
+	[[nodiscard]] bool                  DirectVram() const noexcept {
+		return (m_flags & detail::kDeviceLocal) && (m_flags & detail::kHostVisible);
+	}
+	[[nodiscard]] explicit operator bool() const noexcept { return m_buffer != VK_NULL_HANDLE; }
+
+private:
+	friend class Allocator;
+
+	static constexpr uint32_t kInvalidBlock = UINT32_MAX;
+
+	void MoveFrom(Buffer& other) noexcept {
+		m_owner        = other.m_owner;
+		m_buffer       = other.m_buffer;
+		m_memory       = other.m_memory;
+		m_memoryOffset = other.m_memoryOffset;
+		m_memorySize   = other.m_memorySize;
+		m_allocSize    = other.m_allocSize;
+		m_size         = other.m_size;
+		m_mapped       = other.m_mapped;
+		m_flags        = other.m_flags;
+		m_block        = other.m_block;
+
+		other.m_owner  = nullptr;
+		other.m_buffer = VK_NULL_HANDLE;
+		other.m_memory = VK_NULL_HANDLE;
+		other.m_mapped = nullptr;
+		other.m_block  = kInvalidBlock;
+	}
+
+	Allocator*            m_owner        = nullptr;
+	VkBuffer              m_buffer       = VK_NULL_HANDLE;
+	VkDeviceMemory        m_memory       = VK_NULL_HANDLE; // The block this buffer is bound to.
+	VkDeviceSize          m_memoryOffset = 0;              // Offset of the buffer inside m_memory.
+	VkDeviceSize          m_memorySize   = 0;              // Size of the whole block.
+	VkDeviceSize          m_allocSize    = 0;              // Bytes reserved in the block (with padding).
+	VkDeviceSize          m_size         = 0;              // Size requested by the caller.
+	void*                 m_mapped       = nullptr;
+	VkMemoryPropertyFlags m_flags        = 0;
+	uint32_t              m_block        = kInvalidBlock;
+};
+
+class Allocator {
+public:
+	// `budgetExtensionEnabled` must be true only if VK_EXT_memory_budget was enabled on `device`.
+	Allocator(VkPhysicalDevice gpu, VkDevice device, bool budgetExtensionEnabled, const AllocatorConfig& config = {}) noexcept
+	    : m_gpu(gpu), m_device(device), m_budget(budgetExtensionEnabled), m_config(config) {
+		vkGetPhysicalDeviceMemoryProperties(gpu, &m_mem);
+
+		VkPhysicalDeviceProperties props {};
+		vkGetPhysicalDeviceProperties(gpu, &props);
+
+		m_atom           = std::max<VkDeviceSize>(props.limits.nonCoherentAtomSize, 1);
+		m_maxAllocations = props.limits.maxMemoryAllocationCount;
+		if (config.maxAllocations != 0) {
+			m_maxAllocations = std::min(m_maxAllocations, config.maxAllocations);
+		}
+	}
+
+	~Allocator() {
+		assert(m_liveBuffers == 0 && "KytyVulkan::Buffer objects must be destroyed before their Allocator");
+
+		for (Block& block: m_blocks) {
+			if (block.memory != VK_NULL_HANDLE) {
+				vkFreeMemory(m_device, block.memory, nullptr);
+			}
+		}
+	}
+
+	Allocator(const Allocator&)            = delete;
+	Allocator& operator=(const Allocator&) = delete;
+
+	[[nodiscard]] MemoryInfo Info() const noexcept { return QueryMemoryInfo(m_mem); }
+
+	// Creates a buffer and binds it to (sub-allocated) memory chosen according to `usage`.
+	// On failure `out` is left empty and nothing is leaked.
+	[[nodiscard]] VkResult CreateBuffer(VkDeviceSize size, VkBufferUsageFlags buffer_usage, MemoryUsage memory_usage, Buffer& out) noexcept {
+		out.Reset();
+
+		if (size == 0 || buffer_usage == 0) {
+			return detail::kInvalidArgument;
+		}
+
+		try {
+			return CreateBufferImpl(size, buffer_usage, memory_usage, out);
+		} catch (...) {
+			return VK_ERROR_OUT_OF_HOST_MEMORY;
+		}
+	}
+
+	// Writes CPU-modified data of a non-coherent buffer to the device. A no-op for coherent or
+	// unmapped buffers. The range is expanded to nonCoherentAtomSize as the specification requires.
+	[[nodiscard]] VkResult Flush(const Buffer& buffer, VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const noexcept {
+		VkMappedMemoryRange range {};
+		const VkResult      result = MakeRange(buffer, offset, size, range);
+		if (result != VK_SUCCESS || range.memory == VK_NULL_HANDLE) {
+			return result;
+		}
+		return vkFlushMappedMemoryRanges(m_device, 1, &range);
+	}
+
+	// Makes GPU writes visible to the CPU before reading a non-coherent buffer. Same range
+	// handling as Flush.
+	[[nodiscard]] VkResult Invalidate(const Buffer& buffer, VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE) const noexcept {
+		VkMappedMemoryRange range {};
+		const VkResult      result = MakeRange(buffer, offset, size, range);
+		if (result != VK_SUCCESS || range.memory == VK_NULL_HANDLE) {
+			return result;
+		}
+		return vkInvalidateMappedMemoryRanges(m_device, 1, &range);
+	}
+
+	// Returns completely unused memory blocks to the driver. Call it at level transitions.
+	// Blocks that still contain live buffers are never touched.
+	void Trim() noexcept {
+		const std::lock_guard lock(m_mutex);
+
+		for (uint32_t i = 0; i < m_blocks.size(); i++) {
+			const Block& block = m_blocks[i];
+			if (block.memory != VK_NULL_HANDLE && !block.dedicated && block.liveAllocations == 0) {
+				DestroyBlock(i);
+			}
+		}
+	}
+
+	[[nodiscard]] AllocatorStats GetStats() const noexcept {
+		const std::lock_guard lock(m_mutex);
+
+		AllocatorStats stats;
+		stats.deviceMemoryAllocations = m_deviceMemoryCount;
+		stats.liveBuffers             = m_liveBuffers;
+		stats.reservedBytes           = m_reservedBytes;
+		stats.usedBytes               = m_usedBytes;
+		return stats;
+	}
+
+private:
+	friend class Buffer;
+
+	struct FreeRange {
+		VkDeviceSize offset;
+		VkDeviceSize size;
+	};
+
+	// One VkDeviceMemory object. Dedicated blocks hold exactly one buffer; shared blocks are
+	// carved up through `freeRanges` (sorted by offset, never adjacent to each other).
+	struct Block {
+		VkDeviceMemory         memory          = VK_NULL_HANDLE; // VK_NULL_HANDLE marks an unused slot.
+		VkDeviceSize           size            = 0;
+		std::byte*             mapped          = nullptr;        // Persistently mapped when host visible.
+		uint32_t               memoryType      = 0;
+		uint32_t               liveAllocations = 0;
+		bool                   dedicated       = false;
+		std::vector<FreeRange> freeRanges;
+	};
+
+	struct Allocation {
+		uint32_t     block  = 0;
+		VkDeviceSize offset = 0; // Offset inside the block's VkDeviceMemory.
+		VkDeviceSize size   = 0; // Bytes reserved, including padding.
+	};
+
+	struct Preference {
+		VkMemoryPropertyFlags want;   // Flags the memory type must have.
+		VkMemoryPropertyFlags forbid; // Flags the memory type must not have.
+	};
+
+	// Number of free-list entries reserved per block so that normal use never reallocates.
+	static constexpr size_t kFreeListReserve = 64;
+
+	[[nodiscard]] static std::span<const Preference> Preferences(MemoryUsage usage) noexcept {
+		using namespace detail;
+
+		static constexpr Preference kDeviceOnly[] = {{kDeviceLocal, 0}};
+		static constexpr Preference kStaging[]    = {{kHostVisible | kHostCoherent, kDeviceLocal}, {kHostVisible | kHostCoherent, 0}};
+		static constexpr Preference kBarUpload[]  = {{kDeviceLocal | kHostVisible | kHostCoherent, 0},
+		                                             {kHostVisible | kHostCoherent, kDeviceLocal},
+		                                             {kHostVisible | kHostCoherent, 0}};
+		static constexpr Preference kReadback[]   = {{kHostVisible | kHostCached, kDeviceLocal},
+		                                             {kHostVisible | kHostCoherent, kDeviceLocal},
+		                                             {kHostVisible | kHostCoherent, 0}};
+
+		switch (usage) {
+			case MemoryUsage::DeviceOnly: return kDeviceOnly;
+			case MemoryUsage::Staging: return kStaging;
+			case MemoryUsage::BarUpload: return kBarUpload;
+			case MemoryUsage::Readback: return kReadback;
+		}
+		return {};
+	}
+
+	[[nodiscard]] std::optional<uint32_t> FindType(uint32_t type_bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags forbid) const noexcept {
+		for (uint32_t i = 0; i < m_mem.memoryTypeCount; i++) {
+			const VkMemoryPropertyFlags flags = m_mem.memoryTypes[i].propertyFlags;
+			if ((type_bits & (1u << i)) && (flags & want) == want && (flags & forbid) == 0) {
+				return i;
+			}
+		}
+		return std::nullopt;
+	}
+
+	// Refuses allocations that would exceed the heap budget, which would otherwise trigger
+	// paging or a driver reset. Always true when VK_EXT_memory_budget is not in use.
+	[[nodiscard]] bool HeapHasRoom(uint32_t heap, VkDeviceSize size) const noexcept {
+		if (!m_budget) {
+			return true;
+		}
+
+		VkPhysicalDeviceMemoryBudgetPropertiesEXT budget {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+		VkPhysicalDeviceMemoryProperties2         props {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+		vkGetPhysicalDeviceMemoryProperties2(m_gpu, &props);
+
+		const VkDeviceSize cap  = budget.heapBudget[heap];
+		const VkDeviceSize used = budget.heapUsage[heap];
+		return used <= cap && size <= cap - used;
+	}
+
+	[[nodiscard]] VkDeviceSize BlockSizeFor(VkDeviceSize heap_size) const noexcept {
+		VkDeviceSize size = m_config.blockSize;
+		if (heap_size <= (1ull << 30)) {
+			size = std::min(size, heap_size / 8);
+		}
+		return std::max<VkDeviceSize>(std::min(size, heap_size), 1);
+	}
+
+	[[nodiscard]] VkResult CreateBufferImpl(VkDeviceSize size, VkBufferUsageFlags buffer_usage, MemoryUsage memory_usage, Buffer& out) {
+		const std::lock_guard lock(m_mutex);
+
+		VkBufferCreateInfo info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		info.size        = size;
+		info.usage       = buffer_usage;
+		info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VkBuffer raw = VK_NULL_HANDLE;
+		if (const VkResult result = vkCreateBuffer(m_device, &info, nullptr, &raw); result != VK_SUCCESS) {
+			return result;
+		}
+
+		// Destroys the VkBuffer on every early return and on exceptions.
+		ScopedBufferGuard guard(m_device, raw);
+
+		VkMemoryDedicatedRequirements dedicated {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+		VkMemoryRequirements2         requirements2 {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
+		VkBufferMemoryRequirementsInfo2 requirements_info {VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2, nullptr, raw};
+		vkGetBufferMemoryRequirements2(m_device, &requirements_info, &requirements2);
+
+		const VkMemoryRequirements& requirements = requirements2.memoryRequirements;
+		const bool prefer_dedicated = dedicated.requiresDedicatedAllocation == VK_TRUE || dedicated.prefersDedicatedAllocation == VK_TRUE;
+
+		VkResult last  = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		uint32_t tried = 0; // Bit mask of memory types already attempted.
+
+		for (const Preference& preference: Preferences(memory_usage)) {
+			const std::optional<uint32_t> type = FindType(requirements.memoryTypeBits, preference.want, preference.forbid);
+			if (!type || (tried & (1u << *type))) {
+				continue;
+			}
+			tried |= 1u << *type;
+
+			Allocation allocation {};
+			last = AllocateFromType(*type, requirements, prefer_dedicated, raw, allocation);
+			if (last != VK_SUCCESS) {
+				continue;
+			}
+
+			const Block& block = m_blocks[allocation.block];
+
+			if (const VkResult bind = vkBindBufferMemory(m_device, raw, block.memory, allocation.offset); bind != VK_SUCCESS) {
+				FreeAllocation(allocation);
+				return bind;
+			}
+
+			out.m_owner        = this;
+			out.m_buffer       = guard.Release();
+			out.m_memory       = block.memory;
+			out.m_memoryOffset = allocation.offset;
+			out.m_memorySize   = block.size;
+			out.m_allocSize    = allocation.size;
+			out.m_size         = size;
+			out.m_mapped       = block.mapped != nullptr ? block.mapped + allocation.offset : nullptr;
+			out.m_flags        = m_mem.memoryTypes[*type].propertyFlags;
+			out.m_block        = allocation.block;
+
+			++m_liveBuffers;
+			return VK_SUCCESS;
+		}
+
+		return last;
+	}
+
+	using ScopedBufferGuard = DeviceHandle<VkBuffer, BufferDeleter>;
+
+	[[nodiscard]] VkResult AllocateFromType(uint32_t type, const VkMemoryRequirements& requirements, bool prefer_dedicated,
+	                                        VkBuffer buffer, Allocation& out) {
+		const VkMemoryType& memory_type = m_mem.memoryTypes[type];
+		const VkDeviceSize  heap_size   = m_mem.memoryHeaps[memory_type.heapIndex].size;
+		const VkDeviceSize  block_size  = BlockSizeFor(heap_size);
+
+		if (requirements.size == 0 || requirements.size > heap_size) {
+			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		}
+
+		// Large or driver-preferred allocations get their own VkDeviceMemory. The size must stay
+		// exactly equal to the requirement, as VkMemoryDedicatedAllocateInfo demands.
+		if (prefer_dedicated || requirements.size > block_size / 2) {
+			uint32_t index = 0;
+			if (const VkResult result = CreateBlock(type, requirements.size, true, buffer, index); result != VK_SUCCESS) {
+				return result;
+			}
+
+			m_blocks[index].liveAllocations = 1;
+			m_usedBytes += requirements.size;
+			out = {index, 0, requirements.size};
+			return VK_SUCCESS;
+		}
+
+		// Non-coherent host-visible memory is flushed in nonCoherentAtomSize units. Aligning every
+		// sub-allocation to that size guarantees that a flush or invalidate of one buffer can never
+		// touch the bytes of its neighbour.
+		const bool         atom_aligned = (memory_type.propertyFlags & detail::kHostVisible) && !(memory_type.propertyFlags & detail::kHostCoherent);
+		VkDeviceSize       size         = requirements.size;
+		VkDeviceSize       alignment    = std::max<VkDeviceSize>(requirements.alignment, 1);
+		if (atom_aligned) {
+			size      = detail::AlignUp(size, m_atom);
+			alignment = std::max(alignment, m_atom);
+		}
+
+		for (const uint32_t index: m_typeBlocks[type]) {
+			if (VkDeviceSize offset = 0; TryCarve(m_blocks[index], size, alignment, offset)) {
+				++m_blocks[index].liveAllocations;
+				m_usedBytes += size;
+				out = {index, offset, size};
+				return VK_SUCCESS;
+			}
+		}
+
+		// No block has room: create a new one. If the full block size does not fit (budget or
+		// out of memory), retry with smaller blocks down to the exact size needed.
+		for (VkDeviceSize candidate = std::max(block_size, size);;) {
+			uint32_t       index  = 0;
+			const VkResult result = CreateBlock(type, candidate, false, VK_NULL_HANDLE, index);
+
+			if (result == VK_SUCCESS) {
+				VkDeviceSize offset = 0;
+				if (!TryCarve(m_blocks[index], size, alignment, offset)) {
+					DestroyBlock(index); // Cannot happen (offset 0 is always aligned), but never leak.
+					return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+				}
+
+				++m_blocks[index].liveAllocations;
+				m_usedBytes += size;
+				out = {index, offset, size};
+				return VK_SUCCESS;
+			}
+
+			if (candidate <= size) {
+				return result;
+			}
+			candidate = std::max(candidate / 2, size);
+		}
+	}
+
+	// Creates one VkDeviceMemory block. All operations that can throw (std::vector growth) happen
+	// before the first Vulkan object is created, so a failure can never leak device memory.
+	[[nodiscard]] VkResult CreateBlock(uint32_t type, VkDeviceSize size, bool dedicated, VkBuffer buffer, uint32_t& out_index) {
+		if (m_deviceMemoryCount >= m_maxAllocations) {
+			return VK_ERROR_TOO_MANY_OBJECTS;
+		}
+
+		const VkMemoryType& memory_type = m_mem.memoryTypes[type];
+		if (!HeapHasRoom(memory_type.heapIndex, size)) {
+			return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+		}
+
+		Block block;
+		if (!dedicated) {
+			block.freeRanges.reserve(kFreeListReserve);
+			block.freeRanges.push_back({0, size});
+			if (std::vector<uint32_t>& list = m_typeBlocks[type]; list.size() == list.capacity()) {
+				list.reserve(list.capacity() != 0 ? list.capacity() * 2 : 8);
+			}
+		}
+		if (m_freeSlots.empty() && m_blocks.size() == m_blocks.capacity()) {
+			m_blocks.reserve(m_blocks.capacity() != 0 ? m_blocks.capacity() * 2 : 8);
+			m_freeSlots.reserve(m_blocks.capacity()); // Lets DestroyBlock stay noexcept.
+		}
+
+		VkMemoryDedicatedAllocateInfo dedicated_info {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+		dedicated_info.buffer = buffer;
+
+		VkMemoryAllocateInfo info {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, dedicated ? &dedicated_info : nullptr};
+		info.allocationSize  = size;
+		info.memoryTypeIndex = type;
+
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		if (const VkResult result = vkAllocateMemory(m_device, &info, nullptr, &memory); result != VK_SUCCESS) {
+			return result;
+		}
+
+		void* mapped = nullptr;
+		if (memory_type.propertyFlags & detail::kHostVisible) {
+			// Mapped once for the lifetime of the block; Vulkan forbids mapping memory twice.
+			if (const VkResult result = vkMapMemory(m_device, memory, 0, VK_WHOLE_SIZE, 0, &mapped); result != VK_SUCCESS) {
+				vkFreeMemory(m_device, memory, nullptr);
+				return result;
+			}
+		}
+
+		block.memory     = memory;
+		block.size       = size;
+		block.mapped     = static_cast<std::byte*>(mapped);
+		block.memoryType = type;
+		block.dedicated  = dedicated;
+
+		// Nothing below can throw: capacity was reserved above.
+		if (!m_freeSlots.empty()) {
+			out_index = m_freeSlots.back();
+			m_freeSlots.pop_back();
+			m_blocks[out_index] = std::move(block);
+		} else {
+			out_index = static_cast<uint32_t>(m_blocks.size());
+			m_blocks.push_back(std::move(block));
+		}
+
+		if (!dedicated) {
+			m_typeBlocks[type].push_back(out_index);
+		}
+
+		++m_deviceMemoryCount;
+		m_reservedBytes += size;
+		return VK_SUCCESS;
+	}
+
+	void DestroyBlock(uint32_t index) noexcept {
+		Block& block = m_blocks[index];
+
+		vkFreeMemory(m_device, block.memory, nullptr);
+
+		if (!block.dedicated) {
+			std::erase(m_typeBlocks[block.memoryType], index);
+		}
+
+		--m_deviceMemoryCount;
+		m_reservedBytes -= block.size;
+
+		block = Block {};
+		m_freeSlots.push_back(index); // Capacity is guaranteed by CreateBlock.
+	}
+
+	// Best-fit search in the block's free list. Only the split case (padding AND tail) can grow
+	// the list; the insert happens first so that a failure leaves the block untouched.
+	[[nodiscard]] static bool TryCarve(Block& block, VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& out_offset) {
+		size_t       best        = block.freeRanges.size();
+		VkDeviceSize best_size   = 0;
+		VkDeviceSize best_offset = 0;
+
+		for (size_t i = 0; i < block.freeRanges.size(); i++) {
+			const FreeRange&   range   = block.freeRanges[i];
+			const VkDeviceSize aligned = detail::AlignUp(range.offset, alignment);
+			const VkDeviceSize padding = aligned - range.offset;
+
+			if (range.size >= padding && range.size - padding >= size && (best == block.freeRanges.size() || range.size < best_size)) {
+				best        = i;
+				best_size   = range.size;
+				best_offset = aligned;
+			}
+		}
+
+		if (best == block.freeRanges.size()) {
+			return false;
+		}
+
+		const FreeRange   range   = block.freeRanges[best];
+		const VkDeviceSize padding = best_offset - range.offset;
+		const VkDeviceSize tail    = range.size - padding - size;
+
+		if (padding > 0 && tail > 0) {
+			block.freeRanges.insert(block.freeRanges.begin() + static_cast<std::ptrdiff_t>(best) + 1, FreeRange {best_offset + size, tail});
+			block.freeRanges[best] = {range.offset, padding};
+		} else if (padding > 0) {
+			block.freeRanges[best] = {range.offset, padding};
+		} else if (tail > 0) {
+			block.freeRanges[best] = {best_offset + size, tail};
+		} else {
+			block.freeRanges.erase(block.freeRanges.begin() + static_cast<std::ptrdiff_t>(best));
+		}
+
+		out_offset = best_offset;
+		return true;
+	}
+
+	// Returns a range to the free list and merges it with free neighbours. If the list cannot
+	// grow (out of host memory) the range is simply not reused until the block is destroyed.
+	static void ReleaseRange(Block& block, VkDeviceSize offset, VkDeviceSize size) noexcept {
+		auto next = std::lower_bound(block.freeRanges.begin(), block.freeRanges.end(), offset,
+		                             [](const FreeRange& range, VkDeviceSize value) { return range.offset < value; });
+
+		const bool merge_prev = next != block.freeRanges.begin() && (next - 1)->offset + (next - 1)->size == offset;
+		const bool merge_next = next != block.freeRanges.end() && offset + size == next->offset;
+
+		if (merge_prev && merge_next) {
+			(next - 1)->size += size + next->size;
+			block.freeRanges.erase(next);
+		} else if (merge_prev) {
+			(next - 1)->size += size;
+		} else if (merge_next) {
+			next->offset = offset;
+			next->size += size;
+		} else {
+			try {
+				block.freeRanges.insert(next, FreeRange {offset, size});
+			} catch (...) {
+				// Intentionally ignored: the range stays unused until the block is destroyed.
+			}
+		}
+	}
+
+	void FreeAllocation(const Allocation& allocation) noexcept {
+		Block& block = m_blocks[allocation.block];
+		m_usedBytes -= allocation.size;
+
+		if (block.dedicated) {
+			DestroyBlock(allocation.block);
+			return;
+		}
+
+		ReleaseRange(block, allocation.offset, allocation.size);
+		--block.liveAllocations;
+	}
+
+	// Called by Buffer::Reset.
+	void Release(Buffer& buffer) noexcept {
+		const std::lock_guard lock(m_mutex);
+
+		vkDestroyBuffer(m_device, buffer.m_buffer, nullptr);
+		FreeAllocation({buffer.m_block, buffer.m_memoryOffset, buffer.m_allocSize});
+		--m_liveBuffers;
+	}
+
+	// Builds the VkMappedMemoryRange for a flush / invalidate. `range.memory` stays
+	// VK_NULL_HANDLE when there is nothing to do. The range is aligned to nonCoherentAtomSize and
+	// clamped to the block, which is exactly what the specification requires.
+	[[nodiscard]] VkResult MakeRange(const Buffer& buffer, VkDeviceSize offset, VkDeviceSize size, VkMappedMemoryRange& range) const noexcept {
+		range = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+
+		if (buffer.m_owner == nullptr) {
+			return VK_SUCCESS; // Empty buffer: nothing to flush.
+		}
+		if (buffer.m_owner != this) {
+			return detail::kInvalidArgument; // Buffer belongs to a different allocator.
+		}
+		if (buffer.m_mapped == nullptr || buffer.Coherent()) {
+			return VK_SUCCESS;
+		}
+
+		if (offset > buffer.m_size) {
+			return detail::kInvalidArgument;
+		}
+		if (size == VK_WHOLE_SIZE) {
+			size = buffer.m_size - offset;
+		} else if (size > buffer.m_size - offset) {
+			return detail::kInvalidArgument;
+		}
+		if (size == 0) {
+			return VK_SUCCESS;
+		}
+
+		VkDeviceSize begin = buffer.m_memoryOffset + offset;
+		VkDeviceSize end   = begin + size;
+
+		begin -= begin % m_atom;
+		end = std::min(detail::AlignUp(end, m_atom), buffer.m_memorySize);
+
+		range.memory = buffer.m_memory;
+		range.offset = begin;
+		range.size   = end - begin;
+		return VK_SUCCESS;
+	}
+
+	VkPhysicalDevice                 m_gpu;
+	VkDevice                         m_device;
+	bool                             m_budget;
+	AllocatorConfig                  m_config;
+	VkDeviceSize                     m_atom           = 1;
+	uint32_t                         m_maxAllocations = 0;
+	VkPhysicalDeviceMemoryProperties m_mem {};
+
+	mutable std::mutex m_mutex;
+
+	std::vector<Block>                                  m_blocks;     // Indexed by Allocation::block.
+	std::vector<uint32_t>                               m_freeSlots;  // Unused indices in m_blocks.
+	std::array<std::vector<uint32_t>, VK_MAX_MEMORY_TYPES> m_typeBlocks; // Shared blocks per memory type.
+
+	uint32_t     m_deviceMemoryCount = 0;
+	uint32_t     m_liveBuffers       = 0;
+	VkDeviceSize m_reservedBytes     = 0;
+	VkDeviceSize m_usedBytes         = 0;
+};
+
+inline void Buffer::Reset() noexcept {
+	if (m_owner != nullptr) {
+		m_owner->Release(*this);
+	}
+
+	m_owner        = nullptr;
+	m_buffer       = VK_NULL_HANDLE;
+	m_memory       = VK_NULL_HANDLE;
+	m_memoryOffset = 0;
+	m_memorySize   = 0;
+	m_allocSize    = 0;
+	m_size         = 0;
+	m_mapped       = nullptr;
+	m_flags        = 0;
+	m_block        = kInvalidBlock;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4b. Physical device selection
+// ---------------------------------------------------------------------------------------------
+
+struct GpuRequirements {
+	bool requireTimelineSemaphore = true;  // Needed by SubmitTimeline / WaitTimeline.
+	bool requireMemoryBudget      = false; // Otherwise the allocator just runs without budget checks.
+	bool requireDedicatedCompute  = false; // Async compute on its own queue family.
+	bool requireDedicatedTransfer = false; // Async DMA on its own queue family.
+	bool allowSoftwareRenderer    = false; // llvmpipe, SwiftShader and similar.
+};
+
+struct GpuCandidate {
+	VkPhysicalDevice           gpu = VK_NULL_HANDLE;
+	VkPhysicalDeviceProperties properties {};
+	QueueFamilies              families;
+	DeviceSupport              support;
+	MemoryInfo                 memory;
+	uint64_t                   score = 0;
+};
+
+// Enumerates all GPUs, rejects those that do not meet `req` and returns the best one
+// (discrete > integrated > virtual, then ReBAR, VRAM size and dedicated queues).
+// Returns std::nullopt when no GPU qualifies. May throw std::bad_alloc.
+[[nodiscard]] inline std::optional<GpuCandidate> PickPhysicalDevice(VkInstance instance, const GpuRequirements& req = {}) {
+	if (instance == VK_NULL_HANDLE) {
+		return std::nullopt;
+	}
+
+	std::vector<VkPhysicalDevice> gpus;
+	for (VkResult result = VK_INCOMPLETE; result == VK_INCOMPLETE;) {
+		uint32_t count = 0;
+		if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS) {
+			return std::nullopt;
+		}
+		gpus.assign(count, VK_NULL_HANDLE);
+		result = vkEnumeratePhysicalDevices(instance, &count, gpus.data());
+		gpus.resize(std::min<size_t>(count, gpus.size()));
+		if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+			return std::nullopt;
+		}
+	}
+
+	std::optional<GpuCandidate> best;
+
+	for (const VkPhysicalDevice gpu: gpus) {
+		GpuCandidate candidate;
+		candidate.gpu = gpu;
+		vkGetPhysicalDeviceProperties(gpu, &candidate.properties);
+
+		if (candidate.properties.apiVersion < VK_API_VERSION_1_2) {
+			continue;
+		}
+		if (candidate.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !req.allowSoftwareRenderer) {
+			continue;
+		}
+
+		const std::optional<QueueFamilies> families = PickQueueFamilies(gpu);
+		if (!families) {
+			continue;
+		}
+		candidate.families = *families;
+		candidate.support  = QueryDeviceSupport(gpu);
+
+		if (req.requireTimelineSemaphore && !candidate.support.timelineSemaphore) {
+			continue;
+		}
+		if (req.requireMemoryBudget && !candidate.support.memoryBudget) {
+			continue;
+		}
+		if (req.requireDedicatedCompute && !candidate.families.HasDedicatedCompute()) {
+			continue;
+		}
+		if (req.requireDedicatedTransfer && !candidate.families.HasDedicatedTransfer()) {
+			continue;
+		}
+
+		VkPhysicalDeviceMemoryProperties memory {};
+		vkGetPhysicalDeviceMemoryProperties(gpu, &memory);
+		candidate.memory = QueryMemoryInfo(memory);
+
+		uint64_t score = 0;
+		switch (candidate.properties.deviceType) {
+			case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: score += 10000; break;
+			case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score += 5000; break; // Apple silicon reports this.
+			case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: score += 1000; break;
+			default: break;
+		}
+		if (candidate.memory.resizableBar) {
+			score += 500;
+		}
+		score += std::min<uint64_t>(candidate.memory.deviceLocalBytes >> 30, 64) * 10; // 10 points per GiB.
+		score += candidate.families.HasDedicatedCompute() ? 100 : 0;
+		score += candidate.families.HasDedicatedTransfer() ? 50 : 0;
+		candidate.score = score;
+
+		if (!best || candidate.score > best->score) {
+			best = std::move(candidate);
+		}
+	}
+
+	return best;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. On-disk pipeline cache (less stutter when pipelines are compiled)
+// ---------------------------------------------------------------------------------------------
+
+namespace detail {
+
+struct PipelineCacheHeader {
+	uint32_t headerSize;
+	uint32_t headerVersion;
+	uint32_t vendorID;
+	uint32_t deviceID;
+	uint8_t  uuid[VK_UUID_SIZE];
+};
+static_assert(sizeof(PipelineCacheHeader) == 16 + VK_UUID_SIZE);
+
+// Reads the cache file and returns its content only if the header matches this GPU and driver.
+// Returns an empty vector otherwise. May throw std::bad_alloc.
+[[nodiscard]] inline std::vector<char> ReadValidatedPipelineCache(const VkPhysicalDeviceProperties& props, const std::filesystem::path& file) {
+	constexpr std::streamoff kMaxCacheBytes = 512ll << 20; // Refuse absurd files instead of allocating them.
+
+	std::ifstream in(file, std::ios::binary | std::ios::ate);
+	if (!in) {
+		return {};
+	}
+
+	const std::streamoff size = in.tellg();
+	if (size < static_cast<std::streamoff>(sizeof(PipelineCacheHeader)) || size > kMaxCacheBytes) {
+		return {};
+	}
+
+	std::vector<char> data(static_cast<size_t>(size));
+	in.seekg(0);
+	if (!in.read(data.data(), size)) {
+		return {};
+	}
+
+	PipelineCacheHeader header {};
+	std::memcpy(&header, data.data(), sizeof(header));
+
+	const bool valid = header.headerSize >= sizeof(header) && header.headerSize <= data.size() &&
+	                   header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && header.vendorID == props.vendorID &&
+	                   header.deviceID == props.deviceID && std::memcmp(header.uuid, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+
+	return valid ? data : std::vector<char> {};
+}
+
+} // namespace detail
+
+// Creates a pipeline cache, seeded from `file` when the file matches this GPU and driver. Any
+// problem with the file (missing, corrupt, from another driver) results in an empty cache.
+[[nodiscard]] inline VkResult LoadPipelineCache(VkDevice device, const VkPhysicalDeviceProperties& props,
+                                                const std::filesystem::path& file, VkPipelineCache& out) noexcept {
+	out = VK_NULL_HANDLE;
+
+	std::vector<char> data;
+	try {
+		data = detail::ReadValidatedPipelineCache(props, file);
+	} catch (...) {
+		data.clear();
+	}
+
+	VkPipelineCacheCreateInfo info {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+	info.initialDataSize = data.size();
+	info.pInitialData    = data.empty() ? nullptr : data.data();
+
+	VkResult result = vkCreatePipelineCache(device, &info, nullptr, &out);
+
+	if (result != VK_SUCCESS && !data.empty()) {
+		// The driver rejected the blob despite a valid header: start with an empty cache.
+		out                  = VK_NULL_HANDLE;
+		info.initialDataSize = 0;
+		info.pInitialData    = nullptr;
+		result               = vkCreatePipelineCache(device, &info, nullptr, &out);
+	}
+
+	return result;
+}
+
+// Writes the cache to a temporary file and renames it over `file`, so a crash in the middle of
+// the write can never leave a corrupt cache behind. Returns true on success.
+[[nodiscard]] inline bool SavePipelineCache(VkDevice device, VkPipelineCache cache, const std::filesystem::path& file) noexcept {
+	if (cache == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	try {
+		size_t size = 0;
+		if (vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS || size == 0) {
+			return false;
+		}
+
+		std::vector<char> data(size);
+		if (vkGetPipelineCacheData(device, cache, &size, data.data()) != VK_SUCCESS) {
+			return false; // Includes VK_INCOMPLETE: never persist a truncated cache.
+		}
+		data.resize(size);
+
+		std::filesystem::path temporary = file;
+		temporary += ".tmp";
+
+		bool written = false;
+		{
+			std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+			if (out) {
+				out.write(data.data(), static_cast<std::streamsize>(data.size()));
+				out.flush();
+				written = static_cast<bool>(out);
+			}
+		}
+
+		std::error_code error;
+		if (written) {
+			std::filesystem::rename(temporary, file, error);
+			if (!error) {
+				return true;
+			}
+		}
+
+		std::filesystem::remove(temporary, error);
+		return false;
+	} catch (...) {
+		return false;
+	}
+}
+
+} // namespace KytyVulkan
